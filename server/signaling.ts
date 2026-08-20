@@ -903,6 +903,25 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           broadcastToRoom(info.room, { type: "peer-mic", id: info.id, mic: info.mic });
           break;
         }
+        case "emergency-button": {
+          if (!info.room || info.isModerator || !info.name) return;
+          // The sender plays the sound immediately from its click handler,
+          // which both feels instant and satisfies browser autoplay rules.
+          // Everyone else in this same room receives one event and restarts
+          // the sound from the beginning.
+          broadcastToRoom(
+            info.room,
+            {
+              type: "emergency-button",
+              id: genId(),
+              from: info.id,
+              name: info.name,
+              ts: Date.now(),
+            },
+            socket
+          );
+          break;
+        }
         case "chat": {
           if (!info.room) return;
           const isGif = msg.kind === "gif";
