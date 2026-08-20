@@ -97,6 +97,64 @@ interface RoomInfo {
   sockets: Set<WebSocket>;
   createdAt: number;
   messages: ChatMessage[];
+  music: MusicState;
+}
+
+interface MusicTrack {
+  id: string;
+  videoId: string;
+  title: string;
+  addedBy: string;
+  addedByName: string;
+}
+
+interface MusicState {
+  queue: MusicTrack[];
+  playing: boolean;
+  position: number;
+  updatedAt: number;
+  revision: number;
+}
+
+const YOUTUBE_VIDEO_ID_RE = /^[a-zA-Z0-9_-]{11}$/;
+const MUSIC_QUEUE_LIMIT = 50;
+const MUSIC_TITLE_MAX_LEN = 120;
+const MUSIC_MAX_POSITION_SECONDS = 24 * 60 * 60;
+
+function createMusicState(): MusicState {
+  return { queue: [], playing: false, position: 0, updatedAt: Date.now(), revision: 0 };
+}
+
+function musicPositionNow(music: MusicState): number {
+  if (!music.playing || music.queue.length === 0) return music.position;
+  return music.position + Math.max(0, Date.now() - music.updatedAt) / 1000;
+}
+
+function publicMusicState(music: MusicState) {
+  return {
+    ...music,
+    position: musicPositionNow(music),
+    updatedAt: Date.now(),
+  };
+}
+
+function broadcastMusicState(room: string, roomInfo: RoomInfo) {
+  broadcastToRoom(room, { type: "music-state", music: publicMusicState(roomInfo.music) });
+}
+
+function setMusicPlayback(music: MusicState, playing: boolean, position: number) {
+  music.playing = playing;
+  music.position = position;
+  music.updatedAt = Date.now();
+  music.revision += 1;
+}
+
+function advanceMusicQueue(music: MusicState) {
+  music.queue.shift();
+  music.playing = music.queue.length > 0;
+  music.position = 0;
+  music.updatedAt = Date.now();
+  music.revision += 1;
 }
 
 type AnnouncementButtonAction = "open-new-tab" | "open-same-tab" | "reload";
@@ -380,14 +438,14 @@ const SUPERSEDED_CLOSE_CODE = 4000;
 // seamlessly to the new socket rather than actually leaving the room.
 function detachSession(info: ClientInfo) {
   if (info.room) {
-    const roomInfo = rooms.get(info.room);
+    const room = info.room;
+    const roomInfo = rooms.get(room);
     if (roomInfo) {
       roomInfo.sockets.delete(info.socket);
-      // Deliberately leaves the persisted chat file alone even if this was
-      // the room's last socket: the new connection taking over this
-      // identity is about to "join" the same room again, and will reload
-      // this exact history from disk when it recreates the RoomInfo.
-      if (roomInfo.sockets.size === 0) rooms.delete(info.room);
+      // Keep the in-memory room during the same grace window used by a
+      // normal disconnect. Besides chat, this preserves the synchronized
+      // music queue while a browser reload/reconnect reclaims its identity.
+      if (roomInfo.sockets.size === 0) scheduleRoomDeletion(room);
     }
     info.room = null;
   }
@@ -786,6 +844,17 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           // without this their peer list would keep showing the old name.
           if (info.room && previousName && previousName !== rawName) {
             broadcastToRoom(info.room, { type: "peer-renamed", id: info.id, name: rawName }, socket);
+            const roomInfo = rooms.get(info.room);
+            if (roomInfo) {
+              let changedMusic = false;
+              for (const track of roomInfo.music.queue) {
+                if (track.addedBy === info.id) {
+                  track.addedByName = rawName;
+                  changedMusic = true;
+                }
+              }
+              if (changedMusic) broadcastMusicState(info.room, roomInfo);
+            }
           }
           break;
         }
@@ -815,7 +884,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             const messages = await loadPersistedChat(room);
             roomInfo = rooms.get(room);
             if (!roomInfo) {
-              roomInfo = { sockets: new Set(), createdAt: Date.now(), messages };
+              roomInfo = { sockets: new Set(), createdAt: Date.now(), messages, music: createMusicState() };
               rooms.set(room, roomInfo);
               roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
             }
@@ -831,7 +900,14 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             .map((s) => clients.get(s))
             .filter((c): c is ClientInfo => c !== undefined)
             .map(peerSummary);
-          send(socket, { type: "room-state", room, selfId: info.id, peers, messages: roomInfo.messages });
+          send(socket, {
+            type: "room-state",
+            room,
+            selfId: info.id,
+            peers,
+            messages: roomInfo.messages,
+            music: publicMusicState(roomInfo.music),
+          });
           flushPendingSignals(info);
           broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name }, socket);
           break;
@@ -882,6 +958,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             selfId: info.id,
             peers: adminPeers,
             messages: roomInfo.messages,
+            music: publicMusicState(roomInfo.music),
           });
           flushPendingSignals(info);
           broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name, role: "moderator" }, socket);
@@ -901,6 +978,105 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           if (!info.room) return;
           info.mic = Boolean(msg.mic);
           broadcastToRoom(info.room, { type: "peer-mic", id: info.id, mic: info.mic });
+          break;
+        }
+        case "music-add": {
+          if (!info.room || info.isModerator || !info.name) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (roomInfo.music.queue.length >= MUSIC_QUEUE_LIMIT) {
+            send(socket, { type: "music-error", message: "A fila de músicas está cheia." });
+            return;
+          }
+          const videoId = typeof msg.videoId === "string" ? msg.videoId.trim() : "";
+          if (!YOUTUBE_VIDEO_ID_RE.test(videoId)) {
+            send(socket, { type: "music-error", message: "Link do YouTube inválido." });
+            return;
+          }
+          const requestedTitle =
+            typeof msg.title === "string" ? msg.title.trim().slice(0, MUSIC_TITLE_MAX_LEN) : "";
+          const title = isValidAnnouncementField(requestedTitle, MUSIC_TITLE_MAX_LEN)
+            ? requestedTitle
+            : "Vídeo do YouTube";
+          const wasEmpty = roomInfo.music.queue.length === 0;
+          roomInfo.music.queue.push({
+            id: genId(),
+            videoId,
+            title,
+            addedBy: info.id,
+            addedByName: info.name,
+          });
+          if (wasEmpty) {
+            roomInfo.music.playing = true;
+            roomInfo.music.position = 0;
+            roomInfo.music.updatedAt = Date.now();
+          }
+          roomInfo.music.revision += 1;
+          broadcastMusicState(info.room, roomInfo);
+          break;
+        }
+        case "music-play":
+        case "music-pause": {
+          if (!info.room || info.isModerator) return;
+          const roomInfo = rooms.get(info.room);
+          const current = roomInfo?.music.queue[0];
+          if (!roomInfo || !current) return;
+          if (current.addedBy !== info.id) {
+            send(socket, { type: "music-error", message: "Somente o DJ desta música pode controlá-la." });
+            return;
+          }
+          const requestedPosition =
+            typeof msg.position === "number" && Number.isFinite(msg.position)
+              ? msg.position
+              : musicPositionNow(roomInfo.music);
+          const position = Math.min(MUSIC_MAX_POSITION_SECONDS, Math.max(0, requestedPosition));
+          setMusicPlayback(roomInfo.music, msg.type === "music-play", position);
+          broadcastMusicState(info.room, roomInfo);
+          break;
+        }
+        case "music-skip": {
+          if (!info.room || info.isModerator) return;
+          const roomInfo = rooms.get(info.room);
+          const current = roomInfo?.music.queue[0];
+          if (!roomInfo || !current) return;
+          if (current.addedBy !== info.id) {
+            send(socket, { type: "music-error", message: "Somente o DJ desta música pode pulá-la." });
+            return;
+          }
+          advanceMusicQueue(roomInfo.music);
+          broadcastMusicState(info.room, roomInfo);
+          break;
+        }
+        case "music-remove": {
+          if (!info.room || info.isModerator) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          const trackId = typeof msg.trackId === "string" ? msg.trackId : "";
+          const index = roomInfo.music.queue.findIndex((track) => track.id === trackId);
+          if (index < 0) return;
+          if (roomInfo.music.queue[index].addedBy !== info.id) {
+            send(socket, { type: "music-error", message: "Você só pode remover músicas que adicionou." });
+            return;
+          }
+          if (index === 0) advanceMusicQueue(roomInfo.music);
+          else {
+            roomInfo.music.queue.splice(index, 1);
+            roomInfo.music.revision += 1;
+          }
+          broadcastMusicState(info.room, roomInfo);
+          break;
+        }
+        case "music-ended": {
+          if (!info.room || info.isModerator) return;
+          const roomInfo = rooms.get(info.room);
+          const current = roomInfo?.music.queue[0];
+          const trackId = typeof msg.trackId === "string" ? msg.trackId : "";
+          // Any participant may report the natural end event, but the id
+          // must still match the current track. Duplicate/stale events are
+          // therefore harmless after the first one advances the queue.
+          if (!roomInfo || !current || !roomInfo.music.playing || current.id !== trackId) return;
+          advanceMusicQueue(roomInfo.music);
+          broadcastMusicState(info.room, roomInfo);
           break;
         }
         case "chat": {
