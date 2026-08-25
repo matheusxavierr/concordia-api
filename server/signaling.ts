@@ -42,6 +42,21 @@ const CHAT_MAX_LEN = 500;
 const ANNOUNCEMENT_TEXT_MAX_LEN = 300;
 const ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN = 40;
 const BAN_REASON_MAX_LEN = 200;
+const DIAGNOSTIC_WINDOW_MS = 60_000;
+const MAX_DIAGNOSTICS_PER_WINDOW = 30;
+const DIAGNOSTIC_EVENTS = new Set([
+  "media-config",
+  "pc-connected",
+  "pc-disconnected",
+  "pc-failed",
+  "offer-failed",
+  "answer-failed",
+  "answer-apply-failed",
+  "viewer-timeout",
+  "viewer-restart-request",
+]);
+const DIAGNOSTIC_CHANNELS = new Set(["screen", "camera", "mic"]);
+const DIAGNOSTIC_ROLES = new Set(["broadcaster", "viewer"]);
 // Close code used to reject a connection from a banned IP — distinct from
 // SUPERSEDED_CLOSE_CODE below so the client can tell them apart and show the
 // right message instead of quietly retrying (see signalingClient.ts).
@@ -69,6 +84,8 @@ interface ClientInfo {
   sharing: boolean;
   mic: boolean;
   isAlive: boolean;
+  diagnosticWindowStartedAt: number;
+  diagnosticCount: number;
   socket: WebSocket;
   // The connecting IP (see request.ip in the "/ws" handler below). Never
   // sent to regular participants — only /admin/rooms exposes it, so a
@@ -237,6 +254,33 @@ function broadcastToRoom(room: string, msg: unknown, exclude?: WebSocket) {
   for (const s of roomInfo.sockets) {
     if (s !== exclude) send(s, msg);
   }
+}
+
+function shortClientId(id: string): string {
+  return id.slice(0, 8);
+}
+
+function syncPresence(info: ClientInfo, sharing: boolean, mic: boolean) {
+  if (!info.room) return;
+  if (info.sharing !== sharing) {
+    info.sharing = sharing;
+    broadcastToRoom(info.room, { type: "peer-sharing", id: info.id, sharing });
+  }
+  if (info.mic !== mic) {
+    info.mic = mic;
+    broadcastToRoom(info.room, { type: "peer-mic", id: info.id, mic });
+  }
+}
+
+function canLogDiagnostic(info: ClientInfo): boolean {
+  const now = Date.now();
+  if (now - info.diagnosticWindowStartedAt >= DIAGNOSTIC_WINDOW_MS) {
+    info.diagnosticWindowStartedAt = now;
+    info.diagnosticCount = 0;
+  }
+  if (info.diagnosticCount >= MAX_DIAGNOSTICS_PER_WINDOW) return false;
+  info.diagnosticCount += 1;
+  return true;
 }
 
 // Every open socket on the signaling server, regardless of room — used only
@@ -686,6 +730,8 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       sharing: false,
       mic: false,
       isAlive: true,
+      diagnosticWindowStartedAt: Date.now(),
+      diagnosticCount: 0,
       socket,
       ip,
     };
@@ -772,6 +818,12 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           }
           clientsById.set(info.id, info);
 
+          app.log.info({
+            event: "ws_registered",
+            client: shortClientId(info.id),
+            reclaimed: Boolean(existingById),
+          });
+
           send(socket, {
             type: "registered",
             id: info.id,
@@ -833,7 +885,13 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             .map(peerSummary);
           send(socket, { type: "room-state", room, selfId: info.id, peers, messages: roomInfo.messages });
           flushPendingSignals(info);
-          broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name }, socket);
+          broadcastToRoom(room, { type: "peer-joined", ...peerSummary(info) }, socket);
+          app.log.info({
+            event: "room_joined",
+            client: shortClientId(info.id),
+            peerCount: peers.length,
+            visibility: isPrivateRoom(room) ? "private" : "public",
+          });
           break;
         }
         // A moderator entering a room to watch/listen for moderation.
@@ -891,10 +949,23 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           if (info.room) leaveRoom(info);
           break;
         }
+        case "heartbeat": {
+          info.isAlive = true;
+          syncPresence(
+            info,
+            typeof msg.sharing === "boolean" ? msg.sharing : info.sharing,
+            typeof msg.mic === "boolean" ? msg.mic : info.mic
+          );
+          break;
+        }
         case "sharing": {
           if (!info.room) return;
-          info.sharing = Boolean(msg.sharing);
-          broadcastToRoom(info.room, { type: "peer-sharing", id: info.id, sharing: info.sharing });
+          const sharing = Boolean(msg.sharing);
+          if (info.sharing !== sharing) {
+            info.sharing = sharing;
+            broadcastToRoom(info.room, { type: "peer-sharing", id: info.id, sharing });
+            app.log.info({ event: "sharing_changed", client: shortClientId(info.id), sharing });
+          }
           break;
         }
         case "mic": {
@@ -957,7 +1028,51 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
               ? String((msg.data as { kind: unknown }).kind)
               : "unknown";
           signalsRelayedTotal.inc({ kind: dataKind });
+          if (dataKind !== "ice") {
+            app.log.info({
+              event: "signal_relayed",
+              kind: dataKind,
+              from: shortClientId(info.id),
+              to: shortClientId(targetId),
+            });
+          }
           deliverOrQueueSignal(info.room, targetId, info.id, msg.data);
+          break;
+        }
+        case "diagnostic": {
+          if (!info.room || !canLogDiagnostic(info)) return;
+          const diagnosticEvent = typeof msg.event === "string" ? msg.event : "";
+          if (!DIAGNOSTIC_EVENTS.has(diagnosticEvent)) return;
+          const channel = typeof msg.channel === "string" && DIAGNOSTIC_CHANNELS.has(msg.channel)
+            ? msg.channel
+            : undefined;
+          const role = typeof msg.role === "string" && DIAGNOSTIC_ROLES.has(msg.role)
+            ? msg.role
+            : undefined;
+          const peerId = typeof msg.peerId === "string" && CLIENT_ID_RE.test(msg.peerId)
+            ? shortClientId(msg.peerId)
+            : undefined;
+          const safeState = (value: unknown) =>
+            typeof value === "string" && /^[a-z-]{1,24}$/.test(value) ? value : undefined;
+          const safeCandidateType = (value: unknown) =>
+            typeof value === "string" && ["host", "srflx", "prflx", "relay", "unknown"].includes(value)
+              ? value
+              : undefined;
+          app.log.info({
+            event: "webrtc_diagnostic",
+            diagnosticEvent,
+            client: shortClientId(info.id),
+            peer: peerId,
+            channel,
+            role,
+            connectionState: safeState(msg.connectionState),
+            iceConnectionState: safeState(msg.iceConnectionState),
+            localCandidateType: safeCandidateType(msg.localCandidateType),
+            remoteCandidateType: safeCandidateType(msg.remoteCandidateType),
+            reason: safeState(msg.reason),
+            attempt: typeof msg.attempt === "number" ? Math.min(Math.max(msg.attempt, 1), 20) : undefined,
+            turnConfigured: typeof msg.turnConfigured === "boolean" ? msg.turnConfigured : undefined,
+          });
           break;
         }
         default:
@@ -965,8 +1080,15 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       }
     });
 
-    socket.on("close", () => {
+    socket.on("close", (code, reason) => {
       wsDisconnectionsTotal.inc();
+      app.log.info({
+        event: "ws_closed",
+        client: shortClientId(info.id),
+        code,
+        reason: reason.toString().slice(0, 80),
+        wasInRoom: Boolean(info.room),
+      });
       if (info.room) leaveRoom(info);
       // Guard against a stale/superseded session's delayed close event
       // wiping out a newer reconnect that already took over this name/id.
